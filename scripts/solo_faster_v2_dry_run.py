@@ -57,7 +57,7 @@ def main() -> None:
         root = Path(temp)
         repo = make_repo(root)
         parent = root
-        created = initialize(parent, repo, None, "中", "Web 前端", with_stubs=True, force=True)
+        created = initialize(parent, repo, None, "中", "Web 前端", with_stubs=True, force=True, task_counts=None)
         records = read_workbook(workbook_path(parent, None))
         validation = validate_records(records)
         checks.append({"name": "create default main rows", "ok": validation["ok"], "row_count": validation["row_count"]})
@@ -160,7 +160,7 @@ def main() -> None:
         records = read_workbook(workbook_path(parent, None))
         checks.append({"name": "round 3 failed stops fixing", "ok": choose_next(records)["row"]["主提示词编号"] == "3"})
 
-        for main_number in range(3, 11):
+        for main_number in range(3, 7):
             apply_outcome(
                 parent,
                 None,
@@ -187,28 +187,32 @@ def main() -> None:
                 "dry-run 修复完成",
             )
         records = read_workbook(workbook_path(parent, None))
-        checks.append({"name": "bugfix count reaches 10", "ok": bugfix_count(records) == 10})
+        checks.append({"name": "bugfix count reaches 6", "ok": bugfix_count(records) == 6})
+        checks.append({
+            "name": "0-1 multi-round main count reaches 5",
+            "ok": choose_next(records)["multi_round_counts"]["0-1代码生成"] == 5,
+        })
         apply_outcome(
             parent,
             None,
-            11,
+            7,
             1,
             "未完成",
             reason("目标抓偏到局部展示，没有先把用户最关心的结果归属口径统一起来。"),
             reason("用户完成操作后关键结果还是不可见，界面没有给出可信反馈。"),
             reason("目标抓偏到局部展示，用户完成操作后关键结果还是不可见。"),
             "单文件",
-            "dry-run 上限后不修复",
+            "dry-run 达到多轮上限后不修复",
         )
         records = read_workbook(workbook_path(parent, None))
-        checks.append({"name": "after 10 bugfixes next main only", "ok": choose_next(records)["row"]["主提示词编号"] == "12"})
+        checks.append({"name": "after 5 multi-round mains next main only", "ok": choose_next(records)["row"]["主提示词编号"] == "8"})
 
-        update_row(parent, None, 12, 1, {"执行状态": "已发送", "备注": "dry-run 已发送"})
-        update_row(parent, None, 12, 1, {"执行状态": "Trae运行中", "备注": "dry-run 运行中"})
-        update_row(parent, None, 12, 1, {"执行状态": "超时待人工", "备注": "dry-run 超时待人工"})
+        update_row(parent, None, 8, 1, {"执行状态": "已发送", "备注": "dry-run 已发送"})
+        update_row(parent, None, 8, 1, {"执行状态": "Trae运行中", "备注": "dry-run 运行中"})
+        update_row(parent, None, 8, 1, {"执行状态": "超时待人工", "备注": "dry-run 超时待人工"})
         records = read_workbook(workbook_path(parent, None))
         checks.append({"name": "timeout waits for human", "ok": choose_next(records)["action"] == "confirm"})
-        update_row(parent, None, 12, 1, {"执行状态": "待验收", "备注": "dry-run 恢复后待验收"})
+        update_row(parent, None, 8, 1, {"执行状态": "待验收", "备注": "dry-run 恢复后待验收"})
         records = read_workbook(workbook_path(parent, None))
         checks.append({"name": "resume pending acceptance", "ok": choose_next(records)["action"] == "accept"})
 
