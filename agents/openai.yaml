@@ -1,0 +1,7 @@
+interface:
+  display_name: "solo-faster"
+  short_description: "为单项目或批量项目出题、投递、验收和续写提供完整流程"
+  default_prompt: "使用 $solo-faster 读取当前项目或父目录下的子项目，生成贴项目提示词；批量场景写入 Excel 并按需自动投递到 Trae，已有结果则验收并必要时继续生成修复提示词。"
+
+policy:
+  allow_implicit_invocation: true
