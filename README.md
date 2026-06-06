@@ -29,7 +29,7 @@ mkdir -p "$CODEX_HOME/skills"
 ## 目录说明
 
 - `SKILL.md`：主说明文档
-- `scripts/`：批量生成、Excel 维护、Trae 投递、全局锁等脚本
+- `scripts/`：批量生成、Excel 维护、Trae 辅助与状态流转脚本
 - `references/`：不同任务类型的执行手册
 - `agents/openai.yaml`：skill agent 元数据
 

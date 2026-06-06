@@ -308,8 +308,42 @@ def write_workbook(path: Path, records: list[dict[str, str]]) -> None:
             zf.writestr(name, content)
 
 
-def workbook_path(parent: Path, workbook: str | None) -> Path:
-    return parent / (workbook or DEFAULT_WORKBOOK)
+def default_workbook_name(repo: Path | None = None) -> str:
+    if repo is None:
+        return DEFAULT_WORKBOOK
+    return f"{repo.name}-{DEFAULT_WORKBOOK}"
+
+
+def workbook_candidates(parent: Path, workbook: str | None, repo: Path | None = None) -> list[Path]:
+    if workbook:
+        return [parent / workbook]
+    candidates: list[Path] = []
+    if repo is not None:
+        candidates.append(parent / default_workbook_name(repo))
+    named_workbooks = sorted(
+        candidate
+        for candidate in parent.glob(f"*-{DEFAULT_WORKBOOK}")
+        if candidate.is_file()
+    )
+    if len(named_workbooks) == 1:
+        candidates.append(named_workbooks[0])
+    candidates.append(parent / DEFAULT_WORKBOOK)
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        ordered.append(candidate)
+    return ordered
+
+
+def workbook_path(parent: Path, workbook: str | None, repo: Path | None = None) -> Path:
+    candidates = workbook_candidates(parent, workbook, repo)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def run_git(repo: Path, *args: str) -> str:
@@ -489,7 +523,7 @@ def initialize(
     force: bool,
     task_counts: str | None,
 ) -> dict[str, object]:
-    path = workbook_path(parent, workbook)
+    path = workbook_path(parent, workbook, repo)
     if path.exists() and not force:
         records = read_workbook(path)
         return {"workbook": str(path), "created": False, "count": len(records), "records": records}
@@ -795,7 +829,7 @@ def update_row(
         row[key] = value
     normalize_reason_fields(row)
     row["更新时间"] = now_text()
-    if row.get("执行状态") == "已发送" and not row.get("开始时间"):
+    if row.get("执行状态") in {"已发送", "Trae运行中"} and not row.get("开始时间"):
         row["开始时间"] = row["更新时间"]
     if row.get("执行状态") in {"已完成", "失败"} and not row.get("结束时间"):
         row["结束时间"] = row["更新时间"]
@@ -891,13 +925,14 @@ def format_unsatisfied_reason(process_reason: str, product_reason: str) -> str:
 def changed_paths(repo: Path) -> list[str]:
     status = run_git(repo, "status", "--short")
     paths: list[str] = []
+    workbook_names = {DEFAULT_WORKBOOK, default_workbook_name(repo)}
     for line in status.splitlines():
         if not line.strip():
             continue
         path_text = line[3:]
         if " -> " in path_text:
             path_text = path_text.split(" -> ", 1)[1]
-        if path_text == DEFAULT_WORKBOOK or path_text.endswith(f"/{DEFAULT_WORKBOOK}"):
+        if Path(path_text).name in workbook_names:
             continue
         if Path(path_text).name in {".DS_Store"}:
             continue
@@ -1105,22 +1140,22 @@ def command_locate_project(args: argparse.Namespace) -> dict[str, object]:
     repo = Path(str(repo_result["repo"]))
     parent_candidates = [repo.parent, *repo.parents]
     for parent in parent_candidates:
-        path = workbook_path(parent, args.workbook)
-        if not path.exists():
-            continue
-        try:
-            records = read_workbook(path)
-        except SystemExit as exc:
-            return {"found": False, "workbook": str(path), "error": str(exc)}
-        if any(Path(record.get("仓库路径", "")).resolve() == repo for record in records if record.get("仓库路径")):
-            return {
-                "found": True,
-                "project": str(project),
-                "repo": str(repo),
-                "parent": str(parent),
-                "workbook": str(path),
-                "next": choose_next(records),
-            }
+        for path in workbook_candidates(parent, args.workbook, repo):
+            if not path.exists():
+                continue
+            try:
+                records = read_workbook(path)
+            except SystemExit as exc:
+                return {"found": False, "workbook": str(path), "error": str(exc)}
+            if any(Path(record.get("仓库路径", "")).resolve() == repo for record in records if record.get("仓库路径")):
+                return {
+                    "found": True,
+                    "project": str(project),
+                    "repo": str(repo),
+                    "parent": str(parent),
+                    "workbook": str(path),
+                    "next": choose_next(records),
+                }
     return {"found": False, "project": str(project), "repo": str(repo)}
 
 
