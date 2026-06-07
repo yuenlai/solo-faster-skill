@@ -77,6 +77,7 @@ def main() -> None:
             "--range",
             "2",
             "--dry-run",
+            "--auto-ui",
         )
         next_payload = json.loads(sent_next_main.stdout) if sent_next_main.returncode == 0 else {}
         checks.append({
@@ -125,6 +126,7 @@ def main() -> None:
             "--range",
             "2",
             "--dry-run",
+            "--auto-ui",
         )
         sent_payload = json.loads(sent_fix.stdout) if sent_fix.returncode == 0 else {}
         checks.append({

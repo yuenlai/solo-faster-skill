@@ -218,12 +218,26 @@ python3 $CODEX_HOME/skills/solo-faster/scripts/query_prompt_history.py --project
 - 不再默认依赖 `send_batch_prompts_to_trae.py send` 或 `new-task` 去真实操作 Trae UI。
 - 默认改为：Agent 负责根据 workbook 的断点续跑结果，明确告诉用户“现在该不该新建任务”“当前要发送哪一条提示词”“是否属于修复轮次且必须沿用当前任务上下文”；用户自己在 Trae 里完成发送。
 - 用户发送完成后，会立刻回复当前轮自己的完整 `Trae Session ID`；Agent 收到后再回填 Excel，并把当前轮推进到 `Trae运行中`。
+- 从当前版本开始，`send_batch_prompts_to_trae.py send` 默认进入低 CPU 的人工发送模式，只输出发送说明与提示词，不再自动切窗口、截图、点输入框或回车发送。只有显式传入 `--auto-ui` 时，才允许走 Trae UI 自动化。
+- 从当前版本开始，`send_batch_prompts_to_trae.py monitor` 默认进入低 CPU 的人工等待模式，只返回当前待观察行和后续动作，不再持续轮询 Trae 完成态。只有显式传入 `--active-monitor` 时，才允许启用截图分析、日志追踪和轮询。
 - `send_batch_prompts_to_trae.py` 保留给 dry-run、自检、锁管理和少量状态辅助，不再是默认真实发送路径。
 
 发送辅助命令：
 
 ```bash
 python3 $CODEX_HOME/skills/solo-faster/scripts/send_batch_prompts_to_trae.py send --parent "<父目录>" --repo "<仓库路径>" --range "1" --dry-run
+```
+
+低 CPU 模式下，如需只拿“当前应该发什么”的说明，可直接运行：
+
+```bash
+python3 $CODEX_HOME/skills/solo-faster/scripts/send_batch_prompts_to_trae.py send --parent "<父目录>" --repo "<仓库路径>" --range "1"
+```
+
+只有在确实需要恢复旧的自动化发送行为时，才显式加：
+
+```bash
+python3 $CODEX_HOME/skills/solo-faster/scripts/send_batch_prompts_to_trae.py send --parent "<父目录>" --repo "<仓库路径>" --range "1" --auto-ui
 ```
 
 默认人工发送规则：
@@ -261,6 +275,18 @@ python3 $CODEX_HOME/skills/solo-faster/scripts/send_batch_prompts_to_trae.py sen
 - 如果用户确认 Trae 卡住、失败或需要介入，则按实际情况写 `超时待人工` 或 `失败`，等待处理后再继续。
 
 保留 `monitor` 命令仅用于脚本自检或手工调试，不再属于默认执行路径；当前默认批量流程不依赖锁。
+
+如果只是恢复断点续跑并确认“哪些轮次还在 `Trae运行中`”，不要开主动监控，直接运行：
+
+```bash
+python3 $CODEX_HOME/skills/solo-faster/scripts/send_batch_prompts_to_trae.py monitor --parent "<父目录>" --repo "<仓库路径>"
+```
+
+只有在明确接受更高 CPU 和更重的 Trae UI 检测开销时，才显式加：
+
+```bash
+python3 $CODEX_HOME/skills/solo-faster/scripts/send_batch_prompts_to_trae.py monitor --parent "<父目录>" --repo "<仓库路径>" --active-monitor
+```
 
 ## 验收与回填
 

@@ -735,6 +735,31 @@ def row_identity(row: dict[str, str]) -> tuple[int, int]:
     return int(row["主提示词编号"]), int(row["轮次"])
 
 
+def row_send_mode(row: dict[str, str]) -> str:
+    _, round_number = row_identity(row)
+    return "new-task" if round_number == 1 else "same-task"
+
+
+def manual_send_instruction(records: list[dict[str, str]], row: dict[str, str]) -> dict[str, object]:
+    main, round_number = row_identity(row)
+    new_task_required = requires_new_task_before_send(records, row)
+    row_type = "主提示词" if round_number == 1 else "修复提示词"
+    if new_task_required:
+        instruction = "请先新建任务，再发送下面这条主提示词。"
+    elif row_send_mode(row) == "same-task":
+        instruction = "请不要新建任务，在当前任务下发送下面这条修复提示词。"
+    else:
+        instruction = "请发送下面这条主提示词。"
+    return {
+        "main": str(main),
+        "round": str(round_number),
+        "row_type": row_type,
+        "new_task_required": new_task_required,
+        "instruction": instruction,
+        "prompt": row.get("提示词", "").strip(),
+    }
+
+
 def mark(parent: Path, workbook: str | None, row: dict[str, str], **fields: str) -> dict[str, object]:
     main, round_number = row_identity(row)
     return update_row(parent, workbook, main, round_number, fields)
@@ -802,6 +827,16 @@ def send_rows(args: argparse.Namespace) -> dict[str, object]:
         rows = select_rows(parent, args.workbook, args.range, args.limit, args.status_filter)
         if not args.allow_out_of_order:
             enforce_next_send(records, rows)
+        if not args.auto_ui:
+            instructions = [manual_send_instruction(records, row) for row in rows if row.get("提示词", "").strip()]
+            return {
+                "mode": "manual",
+                "selected_count": len(rows),
+                "instructions": instructions,
+                "message": "低 CPU 模式默认不驱动 Trae UI，也不做窗口切换、截图检测或自动发送。",
+                "next_step": "用户在 Trae 里手动发送后，再把当前轮 Trae Session ID 回填到 workbook。",
+                "lock": lock_info,
+            }
         sent: list[dict[str, str]] = []
         failed: list[dict[str, str]] = []
         if not args.dry_run:
@@ -857,6 +892,24 @@ def monitor(args: argparse.Namespace) -> dict[str, object]:
         events: list[dict[str, str]] = []
         if not selected:
             return {"monitored": 0, "events": events}
+        if not args.active_monitor and not args.dry_run:
+            return {
+                "mode": "manual",
+                "monitored": len(selected),
+                "events": events,
+                "message": "低 CPU 模式默认不持续轮询 Trae，不做截图分析、日志追踪或 UI 完成态检测。",
+                "rows": [
+                    {
+                        "main": row["主提示词编号"],
+                        "round": row["轮次"],
+                        "status": row["执行状态"],
+                        "session_id": row.get("Trae Session ID", "").strip(),
+                    }
+                    for row in selected
+                ],
+                "next_step": "由用户人工确认 Trae 已跑完后回复继续，再进入验收。",
+                "lock": lock_info,
+            }
         if args.resume_timeout:
             for row in selected:
                 if row.get("执行状态") == "超时待人工":
@@ -960,6 +1013,7 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--before-enter-delay", type=float, default=0.8)
     send.add_argument("--after-enter-delay", type=float, default=2.5)
     send.add_argument("--dry-run", action="store_true")
+    send.add_argument("--auto-ui", action="store_true", help="Explicitly enable Trae UI automation. Default is low-CPU manual mode.")
     send.add_argument("--allow-out-of-order", action="store_true", help="Manual recovery only: bypass next-state send protection")
     send.add_argument("--no-auto-new-task", action="store_true", help="Manual recovery only: do not create a new Trae task before a new main prompt")
 
@@ -974,6 +1028,7 @@ def build_parser() -> argparse.ArgumentParser:
     monitor_cmd.add_argument("--once", action="store_true")
     monitor_cmd.add_argument("--resume-timeout", action="store_true")
     monitor_cmd.add_argument("--dry-run", action="store_true")
+    monitor_cmd.add_argument("--active-monitor", action="store_true", help="Explicitly enable polling-based Trae monitoring. Default is low-CPU manual mode.")
     monitor_cmd.add_argument("--simulate", choices=["running", "done", "timeout"], default="running")
 
     task = sub.add_parser("new-task")
