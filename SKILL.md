@@ -283,6 +283,8 @@ python3 $CODEX_HOME/skills/solo-faster/scripts/send_batch_prompts_to_trae.py sen
 git 回填规则：
 
 - `Repo URL` 对同一个仓库内所有行保持一致，优先取 `git remote get-url origin`，回填前去掉末尾 `.git`。
+- 真实执行时默认使用 GitHub SSH 远端；如果 `origin` 还是 `https://github.com/...`，先切到对应的 `git@github.com:owner/repo.git`，再继续后面的 push。
+- 批量流程默认假设本机已经配置好可用的 SSH key 与 GitHub 授权；不要把 HTTPS 用户名密码交互留到执行中途再处理。
 - `Commit ID` 必须对应“当前这一轮提示词验收结束后提交并推送出来的那一个 commit”。
 - 当前轮产生代码改动并执行 git 提交时，提交 message 必须严格等于当前轮自己的 `Trae Session ID`。
 - 主提示词第 1 轮和每一条修复提示词轮次都各自有独立的 `Commit ID`，不能复用上一轮。
@@ -416,6 +418,7 @@ python3 $CODEX_HOME/skills/solo-faster/scripts/batch_prompt_workbook.py insert-f
 要求：
 
 - `Repo URL` 写入 Excel，对同一仓库所有行保持一致，且不要带末尾 `.git`。
+- 推送远端默认使用 SSH；如果仓库 `origin` 还是 GitHub HTTPS 地址，先改成对应 SSH 地址，再执行 `git push origin HEAD`。
 - 无论当前轮验收结果是 `已完成` 还是 `未完成`，都必须尝试执行当前轮 git 提交流程。
 - 当前轮产生代码改动时，必须提交并推送远程 git。
 - 当前轮 git 提交的 message 必须严格使用该轮已经回填好的 `Trae Session ID`，不能自拟别的提交说明。
