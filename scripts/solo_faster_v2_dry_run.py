@@ -320,8 +320,8 @@ def main() -> None:
         checks.append({
             "name": "manual send instruction includes bracketed main and round",
             "ok": manual_next_main.returncode == 0
-            and manual_instruction.get("turn_label") == "【第 2 个第 1 轮】"
-            and str(manual_instruction.get("instruction", "")).startswith("【第 2 个第 1 轮】"),
+            and manual_instruction.get("turn_label") == "【第 2 个主提示词，第 1 轮】"
+            and str(manual_instruction.get("instruction", "")).startswith("【第 2 个主提示词，第 1 轮】"),
             "instruction": manual_instruction,
         })
 
@@ -390,8 +390,8 @@ def main() -> None:
         checks.append({
             "name": "manual fix instruction includes bracketed main and round",
             "ok": manual_fix.returncode == 0
-            and manual_fix_instruction.get("turn_label") == "【第 2 个第 2 轮】"
-            and str(manual_fix_instruction.get("instruction", "")).startswith("【第 2 个第 2 轮】"),
+            and manual_fix_instruction.get("turn_label") == "【第 2 个主提示词，第 2 轮】"
+            and str(manual_fix_instruction.get("instruction", "")).startswith("【第 2 个主提示词，第 2 轮】"),
             "instruction": manual_fix_instruction,
         })
 
@@ -558,6 +558,24 @@ def main() -> None:
                     "任务是否完成": "未完成",
                     "过程与产物是否满意": "不满意",
                     "不满意原因": "过程不满意：浏览器没验到关键链路。\n产物不满意：页面反馈不一致。",
+                },
+            ),
+            bad_audit_case(
+                root,
+                "bad-vague-reason",
+                {
+                    "任务是否完成": "未完成",
+                    "过程与产物是否满意": "不满意",
+                    "不满意原因": "过程不满意：过程比较乱，没完成任务。\n产物不满意：代码有 bug，效果不好。",
+                },
+            ),
+            bad_audit_case(
+                root,
+                "bad-external-reason",
+                {
+                    "任务是否完成": "未完成",
+                    "过程与产物是否满意": "不满意",
+                    "不满意原因": "过程不满意：模型请求失败导致没有继续处理。\n产物不满意：网络波动导致页面结果没有出来。",
                 },
             ),
             bad_duplicate_reason_case(root),

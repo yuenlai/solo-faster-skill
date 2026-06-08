@@ -744,7 +744,7 @@ def manual_send_instruction(records: list[dict[str, str]], row: dict[str, str]) 
     main, round_number = row_identity(row)
     new_task_required = requires_new_task_before_send(records, row)
     row_type = "主提示词" if round_number == 1 else "修复提示词"
-    turn_label = f"【第 {main} 个第 {round_number} 轮】"
+    turn_label = f"【第 {main} 个主提示词，第 {round_number} 轮】"
     if new_task_required:
         instruction = f"{turn_label}【需要新建任务】请发送下面这条主提示词。"
     elif row_send_mode(row) == "same-task":
