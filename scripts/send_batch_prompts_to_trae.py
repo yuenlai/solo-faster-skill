@@ -744,16 +744,18 @@ def manual_send_instruction(records: list[dict[str, str]], row: dict[str, str]) 
     main, round_number = row_identity(row)
     new_task_required = requires_new_task_before_send(records, row)
     row_type = "主提示词" if round_number == 1 else "修复提示词"
+    turn_label = f"【第 {main} 个第 {round_number} 轮】"
     if new_task_required:
-        instruction = "请先新建任务，再发送下面这条主提示词。"
+        instruction = f"{turn_label}【需要新建任务】请发送下面这条主提示词。"
     elif row_send_mode(row) == "same-task":
-        instruction = "请不要新建任务，在当前任务下发送下面这条修复提示词。"
+        instruction = f"{turn_label}【不要新建任务】请在当前任务下发送下面这条修复提示词。"
     else:
-        instruction = "请发送下面这条主提示词。"
+        instruction = f"{turn_label}请发送下面这条主提示词。"
     return {
         "main": str(main),
         "round": str(round_number),
         "row_type": row_type,
+        "turn_label": turn_label,
         "new_task_required": new_task_required,
         "instruction": instruction,
         "prompt": row.get("提示词", "").strip(),
@@ -821,22 +823,23 @@ def requires_new_task_before_send(records: list[dict[str, str]], row: dict[str, 
 def send_rows(args: argparse.Namespace) -> dict[str, object]:
     parent = Path(args.parent).expanduser().resolve()
     repo = Path(args.repo).expanduser().resolve()
+    records = read_workbook(workbook_path(parent, args.workbook))
+    rows = select_rows(parent, args.workbook, args.range, args.limit, args.status_filter)
+    if not args.allow_out_of_order:
+        enforce_next_send(records, rows)
+    if not args.auto_ui:
+        instructions = [manual_send_instruction(records, row) for row in rows if row.get("提示词", "").strip()]
+        return {
+            "mode": "manual",
+            "selected_count": len(rows),
+            "instructions": instructions,
+            "message": "低 CPU 模式默认不驱动 Trae UI，也不做窗口切换、截图检测或自动发送。",
+            "next_step": "用户在 Trae 里手动发送后，先回填当前轮 Trae Session ID；只有回填成功后，才能把该轮推进到 Trae运行中。",
+            "lock": {"mode": "disabled", "reason": "manual mode does not acquire runtime lock"},
+        }
+
     lock_info = acquire_real_execution_lock(repo, f"{DEFAULT_LOCK_STAGE}:send", args.dry_run)
     try:
-        records = read_workbook(workbook_path(parent, args.workbook))
-        rows = select_rows(parent, args.workbook, args.range, args.limit, args.status_filter)
-        if not args.allow_out_of_order:
-            enforce_next_send(records, rows)
-        if not args.auto_ui:
-            instructions = [manual_send_instruction(records, row) for row in rows if row.get("提示词", "").strip()]
-            return {
-                "mode": "manual",
-                "selected_count": len(rows),
-                "instructions": instructions,
-                "message": "低 CPU 模式默认不驱动 Trae UI，也不做窗口切换、截图检测或自动发送。",
-                "next_step": "用户在 Trae 里手动发送后，再把当前轮 Trae Session ID 回填到 workbook。",
-                "lock": lock_info,
-            }
         sent: list[dict[str, str]] = []
         failed: list[dict[str, str]] = []
         if not args.dry_run:
@@ -859,14 +862,13 @@ def send_rows(args: argparse.Namespace) -> dict[str, object]:
                     trigger_new_task_shortcut(repo.name)
                 copy_to_clipboard(prompt)
                 submit_clipboard(repo.name, args.before_enter_delay, args.after_enter_delay)
-                mark(parent, args.workbook, row, 执行状态="已发送", 备注="已发送到 Trae")
-                refreshed = read_workbook(workbook_path(parent, args.workbook))
-                _, sent_row = next(
-                    (idx_row for idx_row in enumerate(refreshed) if int(idx_row[1].get("主提示词编号") or 0) == main and int(idx_row[1].get("轮次") or 0) == round_number),
-                    (None, row),
+                mark(
+                    parent,
+                    args.workbook,
+                    row,
+                    执行状态="已发送",
+                    备注="已发送到 Trae，需立即从当前提示词对应的 SOLO Agent 回复复制 Session ID；回填前不得推进到 Trae运行中",
                 )
-                fields = {"执行状态": "Trae运行中", "备注": "Trae 已接收提示词，需立即从当前提示词对应的 SOLO Agent 回复复制 Session ID 并回填"}
-                mark(parent, args.workbook, sent_row, **fields)
                 sent.append({"main": str(main), "round": str(round_number)})
             except Exception as exc:  # noqa: BLE001
                 failed.append({"main": str(main), "round": str(round_number), "error": str(exc)})
@@ -879,37 +881,38 @@ def send_rows(args: argparse.Namespace) -> dict[str, object]:
 def monitor(args: argparse.Namespace) -> dict[str, object]:
     parent = Path(args.parent).expanduser().resolve()
     repo = Path(args.repo).expanduser().resolve()
+    records = read_workbook(workbook_path(parent, args.workbook))
+    selected = [
+        row
+        for row in records
+        if row.get("执行状态") in {"已发送", "Trae运行中", "超时待人工"}
+        and (args.main is None or int(row.get("主提示词编号") or 0) == args.main)
+        and (args.round is None or int(row.get("轮次") or 0) == args.round)
+    ]
+    events: list[dict[str, str]] = []
+    if not selected:
+        return {"monitored": 0, "events": events}
+    if not args.active_monitor and not args.dry_run:
+        return {
+            "mode": "manual",
+            "monitored": len(selected),
+            "events": events,
+            "message": "低 CPU 模式默认不持续轮询 Trae，不做截图分析、日志追踪或 UI 完成态检测。",
+            "rows": [
+                {
+                    "main": row["主提示词编号"],
+                    "round": row["轮次"],
+                    "status": row["执行状态"],
+                    "session_id": row.get("Trae Session ID", "").strip(),
+                }
+                for row in selected
+            ],
+            "next_step": "先确认所有已发送行都已回填 Trae Session ID；用户人工确认 Trae 已跑完后回复继续，再进入验收。",
+            "lock": {"mode": "disabled", "reason": "manual monitor does not acquire runtime lock"},
+        }
+
     lock_info = acquire_real_execution_lock(repo, f"{DEFAULT_LOCK_STAGE}:monitor", args.dry_run)
     try:
-        records = read_workbook(workbook_path(parent, args.workbook))
-        selected = [
-            row
-            for row in records
-            if row.get("执行状态") in {"已发送", "Trae运行中", "超时待人工"}
-            and (args.main is None or int(row.get("主提示词编号") or 0) == args.main)
-            and (args.round is None or int(row.get("轮次") or 0) == args.round)
-        ]
-        events: list[dict[str, str]] = []
-        if not selected:
-            return {"monitored": 0, "events": events}
-        if not args.active_monitor and not args.dry_run:
-            return {
-                "mode": "manual",
-                "monitored": len(selected),
-                "events": events,
-                "message": "低 CPU 模式默认不持续轮询 Trae，不做截图分析、日志追踪或 UI 完成态检测。",
-                "rows": [
-                    {
-                        "main": row["主提示词编号"],
-                        "round": row["轮次"],
-                        "status": row["执行状态"],
-                        "session_id": row.get("Trae Session ID", "").strip(),
-                    }
-                    for row in selected
-                ],
-                "next_step": "由用户人工确认 Trae 已跑完后回复继续，再进入验收。",
-                "lock": lock_info,
-            }
         if args.resume_timeout:
             for row in selected:
                 if row.get("执行状态") == "超时待人工":

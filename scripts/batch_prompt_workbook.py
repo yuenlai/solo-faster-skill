@@ -10,6 +10,7 @@ import subprocess
 import sys
 import zipfile
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
@@ -74,7 +75,7 @@ DIFFICULTIES = ["简单", "一般", "困难", "地狱"]
 DIFFICULTY_MODES = {
     "低": ["简单", "一般"],
     "中": ["一般", "困难"],
-    "高": ["困难", "地狱"],
+    "高": ["困难"],
 }
 RANGES = ["单文件", "模块内多文件", "跨模块多文件", "跨系统多模块", "无需修改"]
 STATUSES = [
@@ -92,8 +93,51 @@ STATUSES = [
 DONE_VALUES = ["已完成", "未完成"]
 SATISFACTION_VALUES = ["满意", "不满意"]
 ROW_TYPES = ["主提示词", "修复提示词"]
-FORBIDDEN_TERMS = ["稳定", "收口", "收住", "落下来", "这一轮", "上一轮", "当前轮次", "同上", "（继续）"]
+FORBIDDEN_TERMS = [
+    "稳定",
+    "收口",
+    "收住",
+    "落下来",
+    "这一轮",
+    "上一轮",
+    "下一轮",
+    "本轮",
+    "当前轮",
+    "当前轮次",
+    "首轮",
+    "次轮",
+    "第几轮",
+    "第一轮",
+    "第二轮",
+    "第三轮",
+    "前一轮",
+    "后一轮",
+    "第2轮",
+    "第3轮",
+    "同上",
+    "（继续）",
+]
 PUNCTUATION_RE = re.compile(r"[。！？.!?]$")
+FULL_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+GITHUB_REPO_MARKDOWN_RE = re.compile(r"^\[([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\]\(https://github\.com/\1\)$")
+BAD_REASON_TERMS = [
+    "浏览器没验到",
+    "浏览器没验证",
+    "没验到",
+    "没验证",
+    "只通过代码判断",
+    "暂时无法判断",
+    "暂时无法判定",
+    "无法判断",
+    "无法判定",
+    "实现不完整",
+    "没有处理好",
+    "没有核对结果",
+    "缺少校验",
+]
+REASON_DUPLICATE_LONG_FRAGMENT_LIMIT = 18
+REASON_TRIGRAM_JACCARD_LIMIT = 0.30
+REASON_PROMPT_JACCARD_LIMIT = 0.45
 
 
 class WorkbookError(SystemExit):
@@ -131,6 +175,21 @@ def main_task_distribution(task_counts: str | None = None) -> list[tuple[str, in
     if not distribution:
         raise WorkbookError("Invalid --task-counts: no positive main task counts")
     return distribution
+
+
+def interleaved_main_task_order(distribution: list[tuple[str, int]]) -> list[str]:
+    scheduled: list[tuple[float, int, int, str]] = []
+    active_types = [(task_type, count) for task_type, count in distribution if count > 0]
+    if not active_types:
+        return []
+    type_count = len(active_types)
+    for order_index, (task_type, count) in enumerate(active_types):
+        phase = order_index / type_count
+        for occurrence_index in range(count):
+            position = (occurrence_index + phase) / count
+            scheduled.append((position, order_index, occurrence_index, task_type))
+    scheduled.sort()
+    return [task_type for _, _, _, task_type in scheduled]
 
 
 def col_name(index: int) -> str:
@@ -353,14 +412,52 @@ def run_git(repo: Path, *args: str) -> str:
     return result.stdout
 
 
+def run_git_result(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+
+
 def repo_url(repo: Path) -> str:
     result = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"], capture_output=True, text=True)
     if result.returncode != 0:
         return ""
-    url = result.stdout.strip()
-    if url.endswith(".git"):
-        url = url[:-4]
+    return normalized_repo_url_from_remote(result.stdout.strip())
+
+
+def ssh_remote_url(url: str) -> str:
+    if url.startswith("https://github.com/"):
+        path = url.removeprefix("https://github.com/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        return f"git@github.com:{path}.git"
     return url
+
+
+def normalized_repo_url_from_remote(url: str) -> str:
+    value = (url or "").strip()
+    if not value:
+        return ""
+    markdown = re.fullmatch(r"\[([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\]\(https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:\.git)?\)", value)
+    if markdown:
+        path = markdown.group(1)
+        if markdown.group(2) == path:
+            return f"[{path}](https://github.com/{path})"
+    if value.endswith(".git"):
+        value = value[:-4]
+    if value.startswith("git@github.com:"):
+        path = value.removeprefix("git@github.com:")
+        return f"[{path}](https://github.com/{path})"
+    if value.startswith("https://github.com/"):
+        path = value.removeprefix("https://github.com/")
+        return f"[{path}](https://github.com/{path})"
+    return value
+
+
+def ensure_ssh_origin(repo: Path) -> tuple[str, str]:
+    current = run_git(repo, "remote", "get-url", "origin").strip()
+    target = ssh_remote_url(current)
+    if target != current:
+        run_git(repo, "remote", "set-url", "origin", target)
+    return current, target
 
 
 def is_git_repo(path: Path) -> bool:
@@ -415,15 +512,17 @@ def detect_domain(repo: Path) -> str:
     except SystemExit:
         all_paths = []
     joined = "\n".join(all_paths).lower()
-    if "package.json" in files and any(marker in joined for marker in ["src/app", "pages/", "components/", "vite", "next.config", "nuxt.config"]):
-        if any(marker in joined for marker in ["api/", "server/", "backend/", "prisma", "routes/"]):
-            return "全栈 Web 应用"
+    frontend = has_frontend_signals(files, joined)
+    backend = has_backend_signals(files, joined)
+    if frontend and backend:
+        return "全栈 Web 应用"
+    if frontend:
         return "Web 前端"
     if any(name in files for name in ["pyproject.toml", "requirements.txt"]) and any(marker in joined for marker in ["sklearn", "tensorflow", "torch", "model", "notebook", ".ipynb"]):
         return "AI/ML 应用"
     if any(name in files for name in ["pyproject.toml", "requirements.txt"]) and any(marker in joined for marker in ["pandas", "plot", "chart", "visual", "dashboard"]):
         return "数据分析与可视化"
-    if any(name in files for name in ["go.mod", "pom.xml", "build.gradle"]) or any(marker in joined for marker in ["controller", "service", "routes", "api/"]):
+    if backend:
         return "纯后端服务"
     if any(marker in joined for marker in ["three", "webgl", "canvas", "d3", "visualization"]):
         return "3D / 交互可视化"
@@ -436,6 +535,71 @@ def detect_domain(repo: Path) -> str:
     if any(name in files for name in ["pyproject.toml", "requirements.txt", "makefile"]) or "scripts/" in joined:
         return "自动化与工具脚本"
     return "全栈 Web 应用"
+
+
+def has_frontend_signals(files: set[str], joined_paths: str) -> bool:
+    frontend_files = {
+        "package.json",
+        "vite.config.js",
+        "vite.config.ts",
+        "next.config.js",
+        "next.config.mjs",
+        "nuxt.config.js",
+        "nuxt.config.ts",
+        "webpack.config.js",
+        "tailwind.config.js",
+        "tailwind.config.ts",
+    }
+    frontend_markers = [
+        "src/app",
+        "pages/",
+        "components/",
+        "views/",
+        "router/",
+        "routes/",
+        "public/",
+        "assets/",
+        "vite",
+        "next.config",
+        "nuxt.config",
+        ".tsx",
+        ".jsx",
+        ".vue",
+        ".svelte",
+    ]
+    return bool(files.intersection(frontend_files) and any(marker in joined_paths for marker in frontend_markers))
+
+
+def has_backend_signals(files: set[str], joined_paths: str) -> bool:
+    backend_files = {
+        "pyproject.toml",
+        "requirements.txt",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "composer.json",
+        "gemfile",
+        "manage.py",
+    }
+    backend_markers = [
+        "api/",
+        "server/",
+        "backend/",
+        "controllers/",
+        "controller/",
+        "services/",
+        "routes/",
+        "prisma/",
+        "migrations/",
+        "models/",
+        "schema.sql",
+        "app.py",
+        "main.py",
+        ".go",
+        ".java",
+        ".php",
+    ]
+    return bool(files.intersection(backend_files) or any(marker in joined_paths for marker in backend_markers))
 
 
 def difficulty_for(mode: str, index: int) -> str:
@@ -500,16 +664,14 @@ def init_records(
     distribution: list[tuple[str, int]],
 ) -> list[dict[str, str]]:
     records: list[dict[str, str]] = []
-    number = 1
-    for task_type, count in distribution:
-        for _ in range(count):
-            difficulty = difficulty_for(difficulty_mode, number)
-            record = empty_record(repo, number, 1, "主提示词", task_type, domain, difficulty)
-            if with_stubs:
-                record["提示词"] = prompt_stub(repo, task_type, number, domain, difficulty)
-                record["执行状态"] = "已生成"
-            records.append(record)
-            number += 1
+    ordered_task_types = interleaved_main_task_order(distribution)
+    for number, task_type in enumerate(ordered_task_types, start=1):
+        difficulty = difficulty_for(difficulty_mode, number)
+        record = empty_record(repo, number, 1, "主提示词", task_type, domain, difficulty)
+        if with_stubs:
+            record["提示词"] = prompt_stub(repo, task_type, number, domain, difficulty)
+            record["执行状态"] = "已生成"
+        records.append(record)
     return records
 
 
@@ -613,6 +775,16 @@ def main_sort_key(record: dict[str, str]) -> tuple[int, int]:
     return (int(record.get("主提示词编号") or 0), int(record.get("轮次") or 0))
 
 
+def send_priority_key(record: dict[str, str]) -> tuple[int, int, int]:
+    row_type = record.get("行类型", "").strip()
+    task_type = record.get("任务类型", "").strip()
+    return (
+        0 if row_type == "修复提示词" or task_type == "Bug修复" else 1,
+        int(record.get("主提示词编号") or 0),
+        int(record.get("轮次") or 0),
+    )
+
+
 def terminal_for_main(records: list[dict[str, str]], main_number: int) -> bool:
     rows = rows_for_main(records, main_number)
     if any(row.get("任务是否完成") == "已完成" for row in rows):
@@ -623,6 +795,29 @@ def terminal_for_main(records: list[dict[str, str]], main_number: int) -> bool:
     if int(latest.get("轮次") or 0) >= 3 and latest.get("任务是否完成") == "未完成":
         return True
     return False
+
+
+def row_missing_required_fields(record: dict[str, str]) -> list[str]:
+    missing: list[str] = []
+    status = record.get("执行状态", "").strip()
+    completion = record.get("任务是否完成", "").strip()
+    session_id = record.get("Trae Session ID", "").strip()
+    commit_id = record.get("Commit ID", "").strip()
+    change_range = record.get("修改范围", "").strip()
+
+    if status in {"Trae运行中", "待验收", "验收中", "超时待人工"} and not session_id:
+        missing.append("Trae Session ID")
+    if status == "已完成":
+        if not session_id:
+            missing.append("Trae Session ID")
+        if not change_range:
+            missing.append("修改范围")
+        # Commit ID may be empty only when there were no code changes and the row note explains it.
+        if not commit_id and "无需修改" != change_range:
+            note = record.get("备注", "").strip()
+            if "无代码改动" not in note and "没有代码改动" not in note:
+                missing.append("Commit ID")
+    return missing
 
 
 def choose_next(records: list[dict[str, str]]) -> dict[str, object]:
@@ -638,9 +833,20 @@ def choose_next(records: list[dict[str, str]]) -> dict[str, object]:
     conflict_statuses = {"已发送", "Trae运行中", "验收中", "超时待人工", "失败"}
 
     executable = sorted(records, key=main_sort_key)
+    send_candidates: list[dict[str, str]] = []
     for record in executable:
         status = record.get("执行状态")
         main_number = int(record.get("主提示词编号") or 0)
+        missing_fields = row_missing_required_fields(record)
+        if missing_fields:
+            return {
+                "action": "confirm",
+                "reason": f"row is missing required fields: {', '.join(missing_fields)}",
+                "row": record,
+                "missing_fields": missing_fields,
+                "bugfix_count": fixes,
+                "multi_round_counts": multi_round_counts,
+            }
         if status in conflict_statuses:
             return {"action": "confirm", "reason": f"row is {status}", "row": record, "bugfix_count": fixes, "multi_round_counts": multi_round_counts}
         if status == "待验收":
@@ -650,7 +856,14 @@ def choose_next(records: list[dict[str, str]]) -> dict[str, object]:
             if latest is record and int(record.get("轮次") or 0) < 3 and fixes < fix_limit and can_insert_fix_for_main(records, main_number, repo):
                 return {"action": "insert-fix", "row": record, "bugfix_count": fixes, "multi_round_counts": multi_round_counts}
         if status in {"待生成", "已生成"} and not terminal_for_main(records, main_number):
-            return {"action": "send", "row": record, "bugfix_count": fixes, "multi_round_counts": multi_round_counts}
+            send_candidates.append(record)
+    if send_candidates:
+        return {
+            "action": "send",
+            "row": min(send_candidates, key=send_priority_key),
+            "bugfix_count": fixes,
+            "multi_round_counts": multi_round_counts,
+        }
     return {"action": "none", "reason": "no executable rows", "bugfix_count": fixes, "multi_round_counts": multi_round_counts}
 
 
@@ -721,6 +934,10 @@ def validate_output_text(label: str, value: str) -> list[str]:
     for term in FORBIDDEN_TERMS:
         if term in value:
             errors.append(f"{label} contains forbidden term: {term}")
+    if label == "不满意原因":
+        for term in BAD_REASON_TERMS:
+            if term in value:
+                errors.append(f"{label} contains invalid audit/process wording: {term}")
     if label in {"提示词", "不满意原因"} and not PUNCTUATION_RE.search(value.strip()):
         errors.append(f"{label} must end with punctuation")
     return errors
@@ -737,6 +954,84 @@ def valid_unsatisfied_reason(value: str) -> bool:
     )
 
 
+def normalize_similarity_text(value: str) -> str:
+    return re.sub(r"[\s，。！？、：；,.!?;:“”\"'（）()《》【】\[\]\-]", "", value or "")
+
+
+def trigrams(value: str) -> set[str]:
+    text = normalize_similarity_text(value)
+    return {text[index : index + 3] for index in range(max(0, len(text) - 2))}
+
+
+def trigram_jaccard(left: str, right: str) -> float:
+    left_grams = trigrams(left)
+    right_grams = trigrams(right)
+    if not left_grams or not right_grams:
+        return 0.0
+    return len(left_grams & right_grams) / len(left_grams | right_grams)
+
+
+def longest_common_text_length(left: str, right: str) -> int:
+    left_text = normalize_similarity_text(left)
+    right_text = normalize_similarity_text(right)
+    blocks = SequenceMatcher(None, left_text, right_text, autojunk=False).get_matching_blocks()
+    return max((block.size for block in blocks), default=0)
+
+
+def split_unsatisfied_reason(value: str) -> tuple[str, str]:
+    match = re.fullmatch(r"过程不满意：(.+)\n产物不满意：(.+)", value.strip(), flags=re.S)
+    if not match:
+        return "", ""
+    return match.group(1).strip(), match.group(2).strip()
+
+
+def validate_candidate_unsatisfied_reason(
+    candidate: str,
+    candidate_prompt: str,
+    existing_records: list[dict[str, str]],
+    *,
+    current_main: int | None = None,
+    current_round: int | None = None,
+) -> list[str]:
+    errors = validate_output_text("不满意原因", candidate)
+    if not valid_unsatisfied_reason(candidate):
+        errors.append("不满意原因 must merge as 过程不满意/产物不满意 lines")
+    if candidate_prompt and trigram_jaccard(candidate, candidate_prompt) >= REASON_PROMPT_JACCARD_LIMIT:
+        errors.append("不满意原因 is too similar to 提示词; rewrite the reason instead of restating the prompt")
+    candidate_process, candidate_product = split_unsatisfied_reason(candidate)
+    for index, record in enumerate(existing_records, start=2):
+        try:
+            same_row = (
+                current_main is not None
+                and current_round is not None
+                and int(record.get("主提示词编号") or 0) == current_main
+                and int(record.get("轮次") or 0) == current_round
+            )
+        except ValueError:
+            same_row = False
+        if same_row:
+            continue
+        existing_reason = record.get("不满意原因", "").strip()
+        if not existing_reason:
+            continue
+        long_reason = longest_common_text_length(candidate, existing_reason)
+        if long_reason >= REASON_DUPLICATE_LONG_FRAGMENT_LIMIT:
+            errors.append(f"不满意原因 shares a long duplicate fragment with row {index} ({long_reason} chars)")
+        score = trigram_jaccard(candidate, existing_reason)
+        if score >= REASON_TRIGRAM_JACCARD_LIMIT:
+            errors.append(f"不满意原因 trigram Jaccard is too high with row {index} ({score:.1%})")
+        existing_process, existing_product = split_unsatisfied_reason(existing_reason)
+        if candidate_process and existing_process:
+            long_process = longest_common_text_length(candidate_process, existing_process)
+            if long_process >= REASON_DUPLICATE_LONG_FRAGMENT_LIMIT:
+                errors.append(f"过程不满意段 shares a long duplicate fragment with row {index} ({long_process} chars)")
+        if candidate_product and existing_product:
+            long_product = longest_common_text_length(candidate_product, existing_product)
+            if long_product >= REASON_DUPLICATE_LONG_FRAGMENT_LIMIT:
+                errors.append(f"产物不满意段 shares a long duplicate fragment with row {index} ({long_product} chars)")
+    return errors
+
+
 def validate_record(record: dict[str, str]) -> list[str]:
     errors: list[str] = []
     if not record.get("Repo ID", "").strip():
@@ -749,6 +1044,11 @@ def validate_record(record: dict[str, str]) -> list[str]:
         errors.append(f"Invalid change range: {record.get('修改范围')}")
     if record.get("任务难度") and record.get("任务难度") not in DIFFICULTIES:
         errors.append(f"Invalid difficulty: {record.get('任务难度')}")
+    repo_url_value = record.get("Repo URL", "").strip()
+    if repo_url_value and not GITHUB_REPO_MARKDOWN_RE.fullmatch(repo_url_value):
+        normalized_url = normalized_repo_url_from_remote(repo_url_value)
+        if not GITHUB_REPO_MARKDOWN_RE.fullmatch(normalized_url):
+            errors.append("Repo URL must use markdown GitHub format: [owner/repo](https://github.com/owner/repo)")
     if record.get("执行状态") not in STATUSES:
         errors.append(f"Invalid status: {record.get('执行状态')}")
     if record.get("任务是否完成") and record.get("任务是否完成") not in DONE_VALUES:
@@ -763,6 +1063,24 @@ def validate_record(record: dict[str, str]) -> list[str]:
         errors.extend(validate_output_text(label, record.get(label, "")))
     if record.get("任务是否完成") == "已完成" and record.get("过程与产物是否满意") and record.get("过程与产物是否满意") != "满意":
         errors.append("Completed rows must be 满意")
+    if record.get("过程与产物是否满意") == "满意" and record.get("不满意原因", "").strip():
+        errors.append("Satisfied rows must not include 不满意原因")
+    if record.get("执行状态") == "已跳过":
+        executed_fields = [
+            field
+            for field in ["Trae Session ID", "Commit ID", "任务是否完成", "过程与产物是否满意"]
+            if record.get(field, "").strip()
+        ]
+        if executed_fields:
+            errors.append(f"Skipped rows must not include execution evidence: {', '.join(executed_fields)}")
+    if record.get("执行状态") == "已完成" and not record.get("Trae Session ID", "").strip():
+        errors.append("Completed rows must include Trae Session ID")
+    if record.get("执行状态") == "已完成" and record.get("修改范围") != "无需修改" and not record.get("Commit ID", "").strip():
+        errors.append("Completed rows with code changes must include Commit ID")
+    if record.get("Commit ID", "").strip() and record.get("修改范围") == "无需修改":
+        errors.append("Rows with Commit ID must not use 修改范围=无需修改")
+    if record.get("Commit ID", "").strip() and not FULL_COMMIT_RE.fullmatch(record.get("Commit ID", "").strip()):
+        errors.append("Commit ID must be a 40-character git SHA")
     if record.get("任务是否完成") in DONE_VALUES or record.get("执行状态") == "已完成":
         if not record.get("修改范围", "").strip():
             errors.append("Terminal rows must include 修改范围")
@@ -784,6 +1102,7 @@ def validate_records(records: list[dict[str, str]]) -> dict[str, object]:
     for index, record in enumerate(records, start=2):
         for error in validate_record(record):
             errors.append(f"Row {index}: {error}")
+    errors.extend(validate_reason_similarity(records))
     by_main: dict[int, list[int]] = {}
     for record in records:
         try:
@@ -811,6 +1130,37 @@ def validate_records(records: list[dict[str, str]]) -> dict[str, object]:
     return {"ok": not errors, "errors": errors, "row_count": len(records), "bugfix_count": fixes}
 
 
+def validate_reason_similarity(records: list[dict[str, str]]) -> list[str]:
+    errors: list[str] = []
+    reason_rows: list[tuple[int, dict[str, str], str, str, str]] = []
+    for index, record in enumerate(records, start=2):
+        reason = record.get("不满意原因", "").strip()
+        if not reason:
+            continue
+        process_reason, product_reason = split_unsatisfied_reason(reason)
+        reason_rows.append((index, record, reason, process_reason, product_reason))
+        prompt = record.get("提示词", "").strip()
+        if prompt and trigram_jaccard(reason, prompt) >= REASON_PROMPT_JACCARD_LIMIT:
+            errors.append(f"Row {index}: 不满意原因 is too similar to 提示词")
+    for left_index, (row_index, _, reason, process_reason, product_reason) in enumerate(reason_rows):
+        for other_index, _, other_reason, other_process, other_product in reason_rows[left_index + 1 :]:
+            long_reason = longest_common_text_length(reason, other_reason)
+            if long_reason >= REASON_DUPLICATE_LONG_FRAGMENT_LIMIT:
+                errors.append(f"Rows {row_index}/{other_index}: 不满意原因 share a long duplicate fragment ({long_reason} chars)")
+            score = trigram_jaccard(reason, other_reason)
+            if score >= REASON_TRIGRAM_JACCARD_LIMIT:
+                errors.append(f"Rows {row_index}/{other_index}: 不满意原因 trigram Jaccard too high ({score:.1%})")
+            if process_reason and other_process:
+                long_process = longest_common_text_length(process_reason, other_process)
+                if long_process >= REASON_DUPLICATE_LONG_FRAGMENT_LIMIT:
+                    errors.append(f"Rows {row_index}/{other_index}: 过程不满意段 share a long duplicate fragment ({long_process} chars)")
+            if product_reason and other_product:
+                long_product = longest_common_text_length(product_reason, other_product)
+                if long_product >= REASON_DUPLICATE_LONG_FRAGMENT_LIMIT:
+                    errors.append(f"Rows {row_index}/{other_index}: 产物不满意段 share a long duplicate fragment ({long_product} chars)")
+    return errors
+
+
 def update_row(
     parent: Path,
     workbook: str | None,
@@ -826,6 +1176,8 @@ def update_row(
     for key, value in fields.items():
         if key not in HEADERS:
             raise WorkbookError(f"Unknown field: {key}")
+        if key == "Repo URL":
+            value = normalized_repo_url_from_remote(value)
         row[key] = value
     normalize_reason_fields(row)
     row["更新时间"] = now_text()
@@ -838,6 +1190,16 @@ def update_row(
     validate_satisfaction(row.get("过程与产物是否满意"))
     if strict_validate:
         errors = validate_record(row)
+        if row.get("任务是否完成") == "未完成" and row.get("不满意原因", "").strip():
+            errors.extend(
+                validate_candidate_unsatisfied_reason(
+                    row["不满意原因"],
+                    row.get("提示词", ""),
+                    records,
+                    current_main=main_number,
+                    current_round=round_number,
+                )
+            )
         if errors:
             raise WorkbookError("; ".join(errors))
     records[index] = row
@@ -902,6 +1264,9 @@ def apply_outcome(
 ) -> dict[str, object]:
     if completed not in DONE_VALUES:
         raise WorkbookError("Outcome completion must be 已完成 or 未完成")
+    path = workbook_path(parent, workbook)
+    records = read_workbook(path)
+    _, existing_row = find_row(records, main_number, round_number)
     fields: dict[str, str] = {
         "任务是否完成": completed,
         "执行状态": "已完成",
@@ -911,9 +1276,18 @@ def apply_outcome(
     }
     if completed == "未完成":
         fields["不满意原因"] = reason.strip() if valid_unsatisfied_reason(reason or "") else format_unsatisfied_reason(process_reason, product_reason)
+        reason_errors = validate_candidate_unsatisfied_reason(
+            fields["不满意原因"],
+            existing_row.get("提示词", ""),
+            records,
+            current_main=main_number,
+            current_round=round_number,
+        )
+        if reason_errors:
+            raise WorkbookError("; ".join(reason_errors))
     else:
         fields["不满意原因"] = ""
-    return update_row(parent, workbook, main_number, round_number, fields)
+    return update_row(parent, workbook, main_number, round_number, fields, strict_validate=False)
 
 
 def format_unsatisfied_reason(process_reason: str, product_reason: str) -> str:
@@ -953,33 +1327,79 @@ def module_name(path: str) -> str:
     return parts[0]
 
 
-def detect_change_range(repo: Path) -> str:
+def detect_change_range(repo: Path, domain: str | None = None) -> str:
     paths = changed_paths(repo)
+    return classify_change_range(paths, domain)
+
+
+def classify_change_range(paths: list[str], domain: str | None = None) -> str:
     if not paths:
         return "无需修改"
     if len(paths) == 1:
         return "单文件"
-    if spans_multiple_systems(paths):
+    if spans_multiple_systems(paths, domain):
         return "跨系统多模块"
     modules = {module_name(path) for path in paths}
     if len(modules) == 1:
         return "模块内多文件"
-    if len(modules) <= 3:
-        return "跨模块多文件"
-    return "跨系统多模块"
+    return "跨模块多文件"
 
 
-def spans_multiple_systems(paths: list[str]) -> bool:
-    systems = {system_name(path) for path in paths}
+def spans_multiple_systems(paths: list[str], domain: str | None = None) -> bool:
+    systems = {system_name(path, domain) for path in paths}
     systems.discard("")
+    if domain == "Web 前端" and systems and systems.issubset({"frontend", "frontend-config"}):
+        return False
     return len(systems) >= 2
 
 
-def system_name(path: str) -> str:
+def system_name(path: str, domain: str | None = None) -> str:
     parts = Path(path).parts
     top = parts[0] if parts else path
     suffix = Path(path).suffix.lower()
     name = Path(path).name.lower()
+    frontend_config_names = {
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "vite.config.js",
+        "vite.config.ts",
+        "webpack.config.js",
+        "next.config.js",
+        "next.config.mjs",
+        "nuxt.config.js",
+        "nuxt.config.ts",
+        "tailwind.config.js",
+        "tailwind.config.ts",
+        "postcss.config.js",
+        "tsconfig.json",
+        "jsconfig.json",
+    }
+    frontend_tops = {
+        "src",
+        "app",
+        "components",
+        "pages",
+        "views",
+        "routes",
+        "router",
+        "store",
+        "stores",
+        "styles",
+        "assets",
+        "static",
+        "public",
+        "hooks",
+        "composables",
+        "utils",
+        "lib",
+    }
+    if domain == "Web 前端":
+        if top in frontend_tops or suffix in {".css", ".scss", ".sass", ".less", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".vue", ".svelte", ".html"}:
+            return "frontend"
+        if name in frontend_config_names:
+            return "frontend-config"
     if top in {"admin", "backend", "server", "api"}:
         return "backend-admin" if top == "admin" else "backend"
     if top in {"frontend", "client", "web", "pages", "public"}:
@@ -1004,6 +1424,130 @@ def lint_texts(parent: Path, workbook: str | None) -> dict[str, object]:
             for error in validate_output_text(label, record.get(label, "")):
                 errors.append(f"Row {index}: {error}")
     return {"ok": not errors, "errors": errors}
+
+
+def audit_git_integrity(records: list[dict[str, str]], repo: Path | None = None) -> list[str]:
+    errors: list[str] = []
+    for index, record in enumerate(records, start=2):
+        commit_id = record.get("Commit ID", "").strip()
+        if not commit_id:
+            continue
+        if not FULL_COMMIT_RE.fullmatch(commit_id):
+            errors.append(f"Row {index}: Commit ID is not a full 40-character SHA: {commit_id}")
+            continue
+        row_repo = repo
+        if row_repo is None and record.get("仓库路径", "").strip():
+            row_repo = Path(record["仓库路径"]).expanduser().resolve()
+        if row_repo is None or not row_repo.exists():
+            errors.append(f"Row {index}: repository path is unavailable for Commit ID audit")
+            continue
+        object_type = run_git_result(row_repo, "cat-file", "-t", commit_id)
+        if object_type.returncode != 0 or object_type.stdout.strip() != "commit":
+            errors.append(f"Row {index}: Commit ID does not resolve to a local commit: {commit_id}")
+            continue
+        session_id = record.get("Trae Session ID", "").strip()
+        message = run_git(row_repo, "log", "-1", "--format=%B", commit_id).strip()
+        if session_id and message != session_id:
+            errors.append(f"Row {index}: commit message must equal Trae Session ID")
+    return errors
+
+
+def audit_records(parent: Path, workbook: str | None, repo: Path | None = None) -> dict[str, object]:
+    path = workbook_path(parent, workbook, repo)
+    records = read_workbook(path)
+    result = validate_records(records)
+    git_errors = audit_git_integrity(records, repo)
+    result["git_errors"] = git_errors
+    result["ok"] = bool(result["ok"]) and not git_errors
+    result["workbook"] = str(path)
+    return result
+
+
+def finalize_round(
+    parent: Path,
+    workbook: str | None,
+    repo: Path,
+    main_number: int,
+    round_number: int,
+    *,
+    no_push: bool = False,
+) -> dict[str, object]:
+    path = workbook_path(parent, workbook, repo)
+    records = read_workbook(path)
+    _, row = find_row(records, main_number, round_number)
+    session_id = row.get("Trae Session ID", "").strip()
+    if not session_id:
+        raise WorkbookError("Trae Session ID is required before git finalize")
+    if row.get("执行状态") != "已完成" or row.get("任务是否完成") not in DONE_VALUES:
+        raise WorkbookError("Run outcome before finalize-round; row must be terminal and include completion")
+
+    domain = row.get("业务领域", "").strip() or None
+    paths = changed_paths(repo)
+    change_range = classify_change_range(paths, domain)
+    repo_url_value = normalized_repo_url_from_remote(run_git(repo, "remote", "get-url", "origin").strip()) if run_git_result(repo, "remote", "get-url", "origin").returncode == 0 else ""
+    if not paths:
+        note = "无代码改动，需人工确认是否继续"
+        result = update_row(
+            parent,
+            workbook,
+            main_number,
+            round_number,
+            {
+                "修改范围": "无需修改",
+                "Commit ID": "",
+                "Repo URL": repo_url_value,
+                "备注": note,
+            },
+        )
+        return {"workbook": str(path), "committed": False, "pushed": False, "change_range": "无需修改", "paths": [], "row": result["row"]}
+
+    if repo_url_value:
+        current_remote, push_remote = ensure_ssh_origin(repo)
+        repo_url_value = normalized_repo_url_from_remote(push_remote)
+    else:
+        current_remote, push_remote = "", ""
+
+    run_git(repo, "add", "--", *paths)
+    run_git(repo, "commit", "-m", session_id)
+    commit_id = run_git(repo, "rev-parse", "HEAD").strip()
+    if not FULL_COMMIT_RE.fullmatch(commit_id):
+        raise WorkbookError(f"git returned invalid Commit ID: {commit_id}")
+    message = run_git(repo, "log", "-1", "--format=%B", commit_id).strip()
+    if message != session_id:
+        raise WorkbookError("Created commit message does not equal Trae Session ID")
+    pushed = False
+    if not no_push:
+        run_git(repo, "push", "origin", "HEAD")
+        pushed = True
+    note_parts = [f"修改文件：{', '.join(paths)}"]
+    if current_remote and current_remote != push_remote:
+        note_parts.append("origin 已切换为 GitHub SSH")
+    result = update_row(
+        parent,
+        workbook,
+        main_number,
+        round_number,
+        {
+            "修改范围": change_range,
+            "Commit ID": commit_id,
+            "Repo URL": repo_url_value,
+            "备注": "；".join(note_parts),
+        },
+    )
+    reread = read_workbook(path)
+    _, persisted = find_row(reread, main_number, round_number)
+    if persisted.get("Commit ID", "").strip() != commit_id:
+        raise WorkbookError("Commit ID was not persisted to workbook")
+    return {
+        "workbook": str(path),
+        "committed": True,
+        "pushed": pushed,
+        "commit_id": commit_id,
+        "change_range": change_range,
+        "paths": paths,
+        "repo_url": repo_url_value,
+        "row": result["row"],
+    }
 
 
 def command_scan(args: argparse.Namespace) -> dict[str, object]:
@@ -1034,7 +1578,7 @@ def command_status(args: argparse.Namespace) -> dict[str, object]:
     statuses: dict[str, int] = {}
     for record in records:
         statuses[record.get("执行状态", "")] = statuses.get(record.get("执行状态", ""), 0) + 1
-    result = validate_records(records)
+    result = audit_records(parent, args.workbook)
     result.update({"workbook": str(path), "statuses": statuses, "next": choose_next(records)})
     return result
 
@@ -1081,8 +1625,19 @@ def field_to_arg(field: str) -> str:
 def command_outcome(args: argparse.Namespace) -> dict[str, object]:
     parent = Path(args.parent or ".").expanduser().resolve()
     change_range = args.change_range
+    repo = Path(args.repo).expanduser().resolve() if args.repo else None
     if not change_range and args.repo:
-        change_range = detect_change_range(Path(args.repo).expanduser().resolve())
+        path = workbook_path(parent, args.workbook, repo)
+        records = read_workbook(path)
+        _, row = find_row(records, args.main, args.round)
+        change_range = detect_change_range(repo, row.get("业务领域", "").strip() or None)
+    elif change_range and args.repo and not args.force_change_range:
+        path = workbook_path(parent, args.workbook, repo)
+        records = read_workbook(path)
+        _, row = find_row(records, args.main, args.round)
+        detected = detect_change_range(repo, row.get("业务领域", "").strip() or None)
+        if detected != change_range:
+            raise WorkbookError(f"Manual change range {change_range} does not match detected range {detected}; use --force-change-range to override")
     if not change_range:
         change_range = "无需修改"
     return apply_outcome(
@@ -1113,13 +1668,21 @@ def command_pick(args: argparse.Namespace) -> dict[str, object]:
 def command_next(args: argparse.Namespace) -> dict[str, object]:
     parent = Path(args.parent or ".").expanduser().resolve()
     records = read_workbook(workbook_path(parent, args.workbook))
+    validation = validate_records(records)
+    git_errors = audit_git_integrity(records)
+    if not validation["ok"] or git_errors:
+        return {
+            "action": "confirm",
+            "reason": "workbook audit failed",
+            "errors": validation["errors"],
+            "git_errors": git_errors,
+        }
     return choose_next(records)
 
 
 def command_lint(args: argparse.Namespace) -> dict[str, object]:
     parent = Path(args.parent or ".").expanduser().resolve()
-    records = read_workbook(workbook_path(parent, args.workbook))
-    result = validate_records(records)
+    result = audit_records(parent, args.workbook)
     text_result = lint_texts(parent, args.workbook)
     result["text_ok"] = text_result["ok"]
     result["text_errors"] = text_result["errors"]
@@ -1129,7 +1692,42 @@ def command_lint(args: argparse.Namespace) -> dict[str, object]:
 
 def command_range(args: argparse.Namespace) -> dict[str, object]:
     repo = Path(args.repo or ".").expanduser().resolve()
-    return {"repo": str(repo), "change_range": detect_change_range(repo), "paths": changed_paths(repo)}
+    return {"repo": str(repo), "change_range": detect_change_range(repo, args.domain), "paths": changed_paths(repo)}
+
+
+def command_audit(args: argparse.Namespace) -> dict[str, object]:
+    parent = Path(args.parent or ".").expanduser().resolve()
+    repo = Path(args.repo).expanduser().resolve() if args.repo else None
+    return audit_records(parent, args.workbook, repo)
+
+
+def command_reason_check(args: argparse.Namespace) -> dict[str, object]:
+    parent = Path(args.parent or ".").expanduser().resolve()
+    path = workbook_path(parent, args.workbook)
+    records = read_workbook(path)
+    _, row = find_row(records, args.main, args.round)
+    candidate = args.reason or format_unsatisfied_reason(args.process_reason or "", args.product_reason or "")
+    errors = validate_candidate_unsatisfied_reason(
+        candidate,
+        row.get("提示词", ""),
+        records,
+        current_main=args.main,
+        current_round=args.round,
+    )
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "regenerate_required": bool(errors),
+        "workbook": str(path),
+        "main": args.main,
+        "round": args.round,
+    }
+
+
+def command_finalize_round(args: argparse.Namespace) -> dict[str, object]:
+    parent = Path(args.parent or ".").expanduser().resolve()
+    repo = Path(args.repo).expanduser().resolve()
+    return finalize_round(parent, args.workbook, repo, args.main, args.round, no_push=args.no_push)
 
 
 def command_locate_project(args: argparse.Namespace) -> dict[str, object]:
@@ -1217,6 +1815,7 @@ def build_parser() -> argparse.ArgumentParser:
     outcome.add_argument("--product-reason", default="")
     outcome.add_argument("--reason", default="")
     outcome.add_argument("--change-range", choices=RANGES)
+    outcome.add_argument("--force-change-range", action="store_true")
     outcome.add_argument("--repo")
     outcome.add_argument("--note", default="")
 
@@ -1244,6 +1843,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     range_cmd = sub.add_parser("change-range")
     range_cmd.add_argument("--repo", default=".")
+    range_cmd.add_argument("--domain", choices=DOMAINS)
+
+    audit_cmd = sub.add_parser("audit")
+    audit_cmd.add_argument("--parent", default=".")
+    audit_cmd.add_argument("--workbook")
+    audit_cmd.add_argument("--repo")
+
+    reason_check = sub.add_parser("reason-check")
+    reason_check.add_argument("--parent", default=".")
+    reason_check.add_argument("--workbook")
+    reason_check.add_argument("--main", type=int, required=True)
+    reason_check.add_argument("--round", type=int, required=True)
+    reason_check.add_argument("--process-reason", default="")
+    reason_check.add_argument("--product-reason", default="")
+    reason_check.add_argument("--reason", default="")
+
+    finalize_cmd = sub.add_parser("finalize-round")
+    finalize_cmd.add_argument("--parent", default=".")
+    finalize_cmd.add_argument("--workbook")
+    finalize_cmd.add_argument("--repo", required=True)
+    finalize_cmd.add_argument("--main", type=int, required=True)
+    finalize_cmd.add_argument("--round", type=int, required=True)
+    finalize_cmd.add_argument("--no-push", action="store_true", help="Create the commit and write Commit ID without pushing; intended for self-check only")
 
     locate = sub.add_parser("locate-project")
     locate.add_argument("--project", default=".")
@@ -1269,6 +1891,9 @@ def main() -> None:
         "next": command_next,
         "lint": command_lint,
         "change-range": command_range,
+        "audit": command_audit,
+        "reason-check": command_reason_check,
+        "finalize-round": command_finalize_round,
         "locate-project": command_locate_project,
         "migrate-headers": command_migrate_headers,
     }
