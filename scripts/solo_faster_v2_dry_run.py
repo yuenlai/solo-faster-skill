@@ -578,6 +578,15 @@ def main() -> None:
                     "不满意原因": "过程不满意：模型请求失败导致没有继续处理。\n产物不满意：网络波动导致页面结果没有出来。",
                 },
             ),
+            bad_audit_case(
+                root,
+                "bad-acceptance-perspective-reason",
+                {
+                    "任务是否完成": "未完成",
+                    "过程与产物是否满意": "不满意",
+                    "不满意原因": "过程不满意：这次改动集中在计时器列表的排序规则上，但我无法在 Codex 内直接看到多个计时器同时存在时的页面排布变化，因此还不能按你的验收标准确认用户真的更不容易盯错计时器。\n产物不满意：实现中已经把运行中的计时器和即将结束的计时器往前排，构建也顺利通过，不过缺少应用内浏览器中的页面结果佐证，暂时不能证明这种优先级调整已经准确落到实际展示顺序。",
+                },
+            ),
             bad_duplicate_reason_case(root),
             bad_duplicate_reason_write_case(root),
             reason_check_regenerate_case(root),
